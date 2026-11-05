@@ -1,4 +1,21 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "sqltools.connections": [
+        {
+            "pgOptions": {
+                "ssl": {
+                    "rejectUnauthorized": true
+                }
+            },
+            "ssh": "Disabled",
+            "previewLimit": 50,
+            "server": "ep-round-tree-a7pvoq1h-pooler.ap-southeast-2.aws.neon.tech",
+            "port": 5432,
+            "driver": "PostgreSQL",
+            "name": "ATLAS-Enterprise-AI",
+            "database": "atlas_ai",
+            "username": "atlas_ai_owner"
+        }
+    ]
 }
