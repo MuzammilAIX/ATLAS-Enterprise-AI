@@ -2,16 +2,18 @@
 ATLAS — FastAPI application.
 
 Endpoints:
-    GET  /health                     - liveness + deps
-    POST /upload                     - upload doc, trigger background ingest
-    POST /query                      - RAG query (fast mode, or safe mode)
-    GET  /documents/{tenant_id}      - list docs
-    GET  /documents/status/{doc_id}  - poll ingestion status
-    POST /feedback                   - record user feedback
-
-Query modes:
-    safe_mode=False (default) — linear rag.query, fast, no HITL
-    safe_mode=True            — graph.run, HITL approval gate + rewrite
+    GET  /                              - single-page frontend
+    GET  /health                        - liveness + deps
+    POST /upload                        - upload doc, trigger background ingest
+    POST /query                         - RAG query (fast mode, or safe mode)
+    GET  /documents/{tenant_id}         - list docs
+    GET  /documents/status/{doc_id}     - poll ingestion status
+    POST /feedback                      - record user feedback
+    GET  /api/approvals                 - list pending approvals
+    GET  /api/approvals/all             - list all approvals
+    GET  /api/approvals/{id}            - fetch one approval
+    POST /api/approvals/{id}/decision   - approve/reject
+    POST /api/approvals/{id}/cancel     - cancel
 
 Run:
     uvicorn app.main:app --reload --port 8000
@@ -21,11 +23,13 @@ import datetime
 import uuid
 from typing import Any
 
-from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, UploadFile
-from fastapi.responses import JSONResponse
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi.responses import HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
-from app import guardrails, rag
+from app import approvals, guardrails, rag
 from app.aws import upload_bytes
 from app.config import settings
 from app.db import audit, connection
@@ -38,6 +42,9 @@ app = FastAPI(
     description="Multi-tenant RAG assistant",
 )
 
+app.mount("/static", StaticFiles(directory="app/static"), name="static")
+templates = Jinja2Templates(directory="app/templates")
+
 
 # ==========================================
 # MODELS
@@ -49,6 +56,7 @@ class QueryRequest(BaseModel):
     conversation_id: str
     top_k: int = Field(default=5, ge=1, le=20)
     safe_mode: bool = False
+    actor: str = "unknown"
 
 
 class QueryResponse(BaseModel):
@@ -59,6 +67,7 @@ class QueryResponse(BaseModel):
     injection_hits: list[str]
     needs_approval: bool = False
     approval_reason: str = ""
+    approval_id: str = ""
     rewritten: bool = False
     steps: list[str] = []
 
@@ -83,6 +92,21 @@ class FeedbackRequest(BaseModel):
     conversation_id: str | None = None
     rating: int = Field(..., ge=-1, le=1)
     note: str | None = None
+
+
+class DecisionRequest(BaseModel):
+    reviewer: str = Field(..., min_length=1, max_length=128)
+    approve: bool
+    note: str | None = None
+
+
+# ==========================================
+# FRONTEND
+# ==========================================
+
+@app.get("/", response_class=HTMLResponse)
+def index(request: Request):
+    return templates.TemplateResponse("index.html", {"request": request})
 
 
 # ==========================================
@@ -132,7 +156,6 @@ async def upload(
         )
 
     doc_id = str(uuid.uuid4())
-    # ✅ FIX: timezone-aware UTC — datetime.utcnow() is deprecated
     year = datetime.datetime.now(datetime.UTC).year
     safe_filename = (file.filename or "upload.bin").replace("/", "_").replace("\\", "_")
     s3_key = f"{tenant_id}/{year}/{doc_id}-{safe_filename}"
@@ -177,7 +200,7 @@ async def upload(
 
 
 # ==========================================
-# QUERY (fast or safe mode)
+# QUERY
 # ==========================================
 
 @app.post("/query", response_model=QueryResponse)
@@ -190,6 +213,7 @@ def query_endpoint(req: QueryRequest) -> QueryResponse:
                 tenant_id=req.tenant_id,
                 conversation_id=req.conversation_id,
                 top_k=req.top_k,
+                actor=req.actor,
             )
         else:
             result = rag.query(
@@ -276,3 +300,72 @@ def feedback(req: FeedbackRequest) -> dict[str, Any]:
         ).fetchone()
 
     return {"id": row["id"], "status": "recorded"}
+
+
+# ==========================================
+# APPROVALS
+# ==========================================
+
+@app.get("/api/approvals")
+def api_list_approvals(tenant_id: str, limit: int = 100) -> dict[str, Any]:
+    """List pending approvals for a tenant."""
+    try:
+        tenant_id = guardrails.validate_tenant_id(tenant_id)
+        items = approvals.list_pending(tenant_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"approvals": items, "count": len(items)}
+
+
+@app.get("/api/approvals/all")
+def api_list_all_approvals(tenant_id: str, limit: int = 100) -> dict[str, Any]:
+    """List all approvals (any status) for a tenant."""
+    try:
+        tenant_id = guardrails.validate_tenant_id(tenant_id)
+        items = approvals.list_all(tenant_id, limit=limit)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return {"approvals": items, "count": len(items)}
+
+
+@app.get("/api/approvals/{approval_id}")
+def api_get_approval(approval_id: str) -> dict[str, Any]:
+    """Fetch one approval by ID."""
+    try:
+        item = approvals.get(approval_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    if not item:
+        raise HTTPException(status_code=404, detail="approval not found")
+
+    return item
+
+
+@app.post("/api/approvals/{approval_id}/decision")
+def api_decide_approval(approval_id: str, req: DecisionRequest) -> dict[str, Any]:
+    """Approve or reject a pending approval."""
+    try:
+        item = approvals.decide(
+            approval_id=approval_id,
+            reviewer=req.reviewer,
+            approve=req.approve,
+            note=req.note,
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return item
+
+
+@app.post("/api/approvals/{approval_id}/cancel")
+def api_cancel_approval(approval_id: str, actor: str) -> dict[str, Any]:
+    """Cancel a pending approval (requester withdrew)."""
+    try:
+        item = approvals.cancel(approval_id, actor=actor)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+
+    return item

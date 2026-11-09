@@ -14,6 +14,38 @@ def client():
 
 
 # ==========================================
+# FRONTEND
+# ==========================================
+
+def test_homepage_served(client):
+    """Root / serves the HTML frontend."""
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "Atlas" in r.text
+    assert "/static/js/app.js" in r.text
+    assert "/static/css/styles.css" in r.text
+    assert "Enterprise AI" in r.text
+
+
+def test_static_css_served(client):
+    """CSS file is served with the expected content."""
+    r = client.get("/static/css/styles.css")
+    assert r.status_code == 200
+    assert "sidebar" in r.text
+    assert "composer" in r.text
+    assert "#0b1020" in r.text  # dark background
+
+
+def test_static_js_served(client):
+    """JS file is served with the expected content."""
+    r = client.get("/static/js/app.js")
+    assert r.status_code == 200
+    assert "conversationId" in r.text
+    assert "/query" in r.text
+    assert "/upload" in r.text
+
+
+# ==========================================
 # HEALTH
 # ==========================================
 
@@ -44,8 +76,12 @@ def test_query_fast_mode(client):
     assert "answer" in body
     assert isinstance(body["answer"], str)
     assert "sources" in body
-    assert body["needs_approval"] is False  # fast mode never sets this
+    assert body["needs_approval"] is False
 
+
+# ==========================================
+# QUERY — SAFE MODE
+# ==========================================
 
 def test_query_safe_mode(client):
     r = client.post(
@@ -80,6 +116,10 @@ def test_query_safe_mode_hitl(client):
     assert body["needs_approval"] is True
     assert "salary" in body["approval_reason"]
 
+
+# ==========================================
+# QUERY — VALIDATION
+# ==========================================
 
 def test_query_rejects_empty_question(client):
     r = client.post(

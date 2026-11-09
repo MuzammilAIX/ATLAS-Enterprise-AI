@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width,initial-scale=1">
+    <title>Atlas | Enterprise Knowledge</title>
+    <link rel="stylesheet" href="/static/css/styles.css?v=2">
+</head>
+<body>
+    <div class="shell">
+        <aside class="sidebar">
+            <div class="logo">✦ <span>ATLAS</span><small>Enterprise AI</small></div>
+            <div class="eyebrow">WORKSPACE</div>
+            <button class="nav active" id="chatTab">◈ &nbsp; Knowledge chat</button>
+            <button class="nav" id="docsTab">▤ &nbsp; Documents</button>
+            <button class="nav" id="approvalTab">✓ &nbsp; Approvals</button>
+            <button class="nav" id="adminTab">◫ &nbsp; Metrics</button>
+            <div class="sidebottom">
+                <label for="tenantInput">Tenant</label>
+                <input id="tenantInput" type="text" value="demo" class="tenant-input">
+                <div style="margin-top:10px">Single-workspace demo · No login</div>
+            </div>
+        </aside>
+        <main>
+            <header>
+                <div>
+                    <span class="eyebrow">YOUR WORKSPACE / KNOWLEDGE</span>
+                    <h1 id="heading">Ask your organization's knowledge</h1>
+                </div>
+                <div class="pill">● AWS-powered</div>
+            </header>
+
+            <!-- CHAT -->
+            <section id="chatView" class="panel">
+                <div class="hero" id="heroBlock">
+                    <div class="spark">✦</div>
+                    <h2>What can I help you find?</h2>
+                    <p>Ask questions about your approved documents. Every answer includes its evidence.</p>
+                    <div class="suggestions">
+                        <button data-q="What is our leave policy?">Leave policy ↗</button>
+                        <button data-q="Summarize the onboarding process">Onboarding ↗</button>
+                        <button data-q="What are the IT security rules?">IT security ↗</button>
+                    </div>
+                </div>
+                <div style="display:flex; gap:10px; margin-bottom:12px;">
+                    <button type="button" id="newChat">+ New conversation</button>
+                    <label class="safe-toggle">
+                        <input type="checkbox" id="safeMode">
+                        <span>Safe mode (HITL)</span>
+                    </label>
+                </div>
+                <div id="messages" aria-live="polite"></div>
+                <form id="chatForm" class="composer">
+                    <textarea id="question" rows="2" placeholder="Ask a question about company knowledge..." required></textarea>
+                    <button type="submit">Send ↗</button>
+                </form>
+                <div class="hint">Answers may be inaccurate. Verify source passages before taking action.</div>
+            </section>
+
+            <!-- DOCS -->
+            <section id="docsView" class="panel hidden">
+                <h2>Knowledge library</h2>
+                <p>Upload an approved PDF, DOCX, TXT or Markdown file. Use non-sensitive demo documents only.</p>
+                <form id="uploadForm">
+                    <input id="file" type="file" accept=".pdf,.docx,.txt,.md" required>
+                    <input id="ownerSub" type="text" value="alice" placeholder="Owner" style="width:120px">
+                    <button>Upload document</button>
+                </form>
+                <div id="docs"></div>
+            </section>
+
+            <!-- APPROVALS (placeholder — feature not built yet) -->
+            <section id="approvalView" class="panel hidden">
+                <div class="section-header">
+                    <div>
+                        <h2>Human-in-the-loop approvals</h2>
+                        <p>Pending requests are shown here when safe mode flags a sensitive question.</p>
+                    </div>
+                    <button type="button" id="refreshApprovals">Refresh</button>
+                </div>
+                <div id="approvalSummary" role="status"></div>
+                <div id="approvalList" aria-live="polite"></div>
+            </section>
+
+            <!-- METRICS -->
+            <section id="adminView" class="panel hidden">
+                <h2>Workspace metrics</h2>
+                <pre id="metrics">Loading metrics...</pre>
+                <h2>Guardrail events</h2>
+                <pre id="guardrailMetrics">Loading guardrail metrics...</pre>
+            </section>
+
+            <div id="toast" role="status"></div>
+        </main>
+    </div>
+    <script src="/static/js/app.js?v=2"></script>
+</body>
+</html>

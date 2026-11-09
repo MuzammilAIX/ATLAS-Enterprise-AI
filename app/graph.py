@@ -7,26 +7,19 @@ Unlike app.rag.query (single-pass linear), this module:
   2. Retrieves top-K chunks
   3. If no results → rewrites the question and retries once
   4. If question is sensitive (contains HITL trigger words) and
-     settings().hitl_enabled → returns a pending_approval state
-     instead of generating an answer
+     settings().hitl_enabled → creates an approval request in Postgres
+     and returns a pending_approval state instead of generating an answer
   5. Otherwise → generates the answer via OpenAI
   6. Records each step in the returned `steps` list for traceability
-
-Pure Python — no LangGraph, no external state store. Easy to test
-against real services with minimal cost.
-
-Entry point:
-    from app.graph import run
-    result = run(question, tenant_id, conversation_id)
 """
 
-from dataclasses import dataclass, field, asdict
+from dataclasses import dataclass, field
 from typing import Any
 
 from openai import OpenAI
 from functools import lru_cache
 
-from app import guardrails, memory, vector
+from app import guardrails, memory, vector, approvals
 from app.config import settings
 from app.observability import trace
 
@@ -39,7 +32,6 @@ SYSTEM_PROMPT = (
     "Do not invent policy facts."
 )
 
-# Words that trigger HITL approval instead of automatic answering
 HITL_TRIGGERS = {
     "salary", "compensation", "termination", "firing",
     "legal", "litigation", "lawsuit", "contract",
@@ -49,20 +41,15 @@ HITL_TRIGGERS = {
 }
 
 
-# ==========================================
-# STATE
-# ==========================================
-
 @dataclass
 class GraphState:
-    """Mutable state passed through the graph."""
     question: str
     tenant_id: str
     conversation_id: str
     top_k: int = 5
     save_to_memory: bool = True
+    actor: str = "unknown"
 
-    # Populated as the graph runs
     clean_question: str = ""
     suspicious: bool = False
     injection_hits: list[str] = field(default_factory=list)
@@ -71,15 +58,12 @@ class GraphState:
     rewritten: bool = False
     needs_approval: bool = False
     approval_reason: str = ""
+    approval_id: str = ""
 
     answer: str = ""
     steps: list[str] = field(default_factory=list)
     error: str = ""
 
-
-# ==========================================
-# LLM
-# ==========================================
 
 @lru_cache(maxsize=1)
 def _embedder():
@@ -107,7 +91,6 @@ def _openai() -> OpenAI:
 
 
 def _rewrite_question(question: str) -> str:
-    """Ask the LLM to rewrite a question that returned no results."""
     s = settings()
     try:
         resp = _openai().chat.completions.create(
@@ -146,11 +129,7 @@ def _format_evidence(matches: list[dict[str, Any]]) -> str:
     return "\n\n".join(lines)
 
 
-def _generate_answer(
-    question: str,
-    evidence: str,
-    history: list[dict[str, Any]],
-) -> str:
+def _generate_answer(question: str, evidence: str, history: list[dict[str, Any]]) -> str:
     s = settings()
     recent = "\n".join(
         f"{row['role']}: {row['content'][:1200]}" for row in (history or [])
@@ -198,7 +177,17 @@ def _node_check_hitl(state: GraphState) -> None:
     if matched:
         state.needs_approval = True
         state.approval_reason = f"matched trigger words: {sorted(matched)}"
-        state.steps.append(f"check_hitl:flagged({len(matched)})")
+
+        # ✅ Persist to approvals table
+        try:
+            state.approval_id = approvals.create(
+                tenant_id=state.tenant_id,
+                requester=state.actor,
+                question=state.clean_question,
+            )
+            state.steps.append(f"check_hitl:flagged({len(matched)})->approval:{state.approval_id[:8]}")
+        except Exception as exc:
+            state.steps.append(f"check_hitl:flagged_but_persist_failed({type(exc).__name__})")
         return
 
     state.steps.append("check_hitl:clean")
@@ -215,7 +204,6 @@ def _node_retrieve(state: GraphState) -> None:
 
 
 def _node_maybe_rewrite(state: GraphState) -> None:
-    """If no results and not already rewritten, rewrite once and retry."""
     if state.matches:
         state.steps.append("rewrite:skipped")
         return
@@ -227,9 +215,8 @@ def _node_maybe_rewrite(state: GraphState) -> None:
     state.rewritten = True
     rewritten = _rewrite_question(state.clean_question)
     if rewritten != state.clean_question:
-        state.steps.append(f"rewrite:retrying")
+        state.steps.append("rewrite:retrying")
         state.clean_question = rewritten
-        # Re-embed + retrieve with the rewritten question
         qvec = _embed(rewritten)
         state.matches = vector.query(
             vector=qvec,
@@ -243,7 +230,6 @@ def _node_maybe_rewrite(state: GraphState) -> None:
 
 def _node_generate(state: GraphState) -> None:
     if state.needs_approval:
-        # Do NOT call OpenAI — leave answer empty, needs_approval=True
         state.steps.append("generate:skipped(approval_needed)")
         return
 
@@ -275,23 +261,9 @@ def run(
     conversation_id: str,
     top_k: int = 5,
     save_to_memory: bool = True,
+    actor: str = "unknown",
 ) -> dict[str, Any]:
-    """
-    Run the multi-step RAG flow.
-
-    Returns:
-        {
-            "answer": str,             # empty if needs_approval
-            "sources": [{"id","score","metadata"}, ...],
-            "conversation_id": str,
-            "suspicious": bool,
-            "injection_hits": list[str],
-            "needs_approval": bool,
-            "approval_reason": str,
-            "rewritten": bool,         # did a rewrite happen?
-            "steps": list[str],        # ordered node names
-        }
-    """
+    """Run the multi-step RAG flow."""
 
     state = GraphState(
         question=question,
@@ -299,9 +271,9 @@ def run(
         conversation_id=conversation_id,
         top_k=top_k,
         save_to_memory=save_to_memory,
+        actor=actor,
     )
 
-    # Node pipeline
     _node_validate(state)
     _node_check_hitl(state)
     _node_retrieve(state)
@@ -320,6 +292,7 @@ def run(
         "injection_hits": state.injection_hits,
         "needs_approval": state.needs_approval,
         "approval_reason": state.approval_reason,
+        "approval_id": state.approval_id,
         "rewritten": state.rewritten,
         "steps": state.steps,
     }
