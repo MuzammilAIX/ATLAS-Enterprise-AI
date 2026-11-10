@@ -2,15 +2,26 @@ fastapi==0.115.12
 uvicorn[standard]==0.34.2
 jinja2==3.1.6
 pydantic-settings==2.8.1
+
+# AWS
 boto3==1.37.38
+
+# Database
 psycopg[binary,pool]==3.2.6
+
+# Document processing
 pypdf==5.4.0
 python-docx==1.1.2
-httpx==0.28.1
+python-multipart
+
+# AI and RAG (sentence-transformers removed — using OpenAI embeddings)
+openai>=1.0.0
 langgraph>=0.2,<2
 pinecone>=5,<9
 
+# HTTP and configuration
+httpx==0.28.1
 python-dotenv==1.0.1
 
-#  observability 
+# Observability
 glassflow-rius>=1.0,<2.0

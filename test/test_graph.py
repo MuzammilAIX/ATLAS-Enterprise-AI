@@ -4,7 +4,7 @@ import uuid
 
 import pytest
 
-from app import memory, vector
+from app import graph, memory, vector
 from app.config import settings
 from app.graph import run
 from app.rag import embed_query
@@ -64,10 +64,11 @@ def test_run_with_evidence(tenant_and_conv):
     assert r["needs_approval"] is False
     assert r["suspicious"] is False
     assert "validate" in r["steps"]
-    assert "retrieve(1)" in r["steps"] or "retrieve(0)" in r["steps"]  # at least retrieve ran
+    assert "retrieve(1)" in r["steps"] or "retrieve(0)" in r["steps"]
 
 
 def test_run_without_evidence_still_answers(tenant_and_conv):
+    """🔧 Empty tenant → refusal message, no sources, no OpenAI answer call."""
     tenant, conv = tenant_and_conv
 
     r = run(
@@ -79,7 +80,74 @@ def test_run_without_evidence_still_answers(tenant_and_conv):
 
     assert "validate" in r["steps"]
     assert r["sources"] == []
-    # Either the model says "cannot find", or it says something about no info
+    # 🔧 MUST be the exact refusal message — not a model-generated guess
+    assert r["answer"] == graph.NO_ANSWER_MESSAGE
+    assert "generate:refused(no_evidence)" in r["steps"]
+
+
+# ==========================================
+# NO-EVIDENCE GATE  (🔧 critical regression tests)
+# ==========================================
+
+def test_no_evidence_does_not_call_openai_for_answer(tenant_and_conv, monkeypatch):
+    """🔧 CRITICAL: When retrieval is empty, the answer generator must not run."""
+    tenant, conv = tenant_and_conv
+
+    # Force retrieval to always return nothing
+    monkeypatch.setattr(graph.vector, "query", lambda **kw: [])
+
+    # Rewrite is allowed (it doesn't fabricate facts), so let it be a no-op
+    monkeypatch.setattr(graph, "_rewrite_question", lambda q: q)
+
+    # If the answer generator is called, fail loudly
+    def _boom(*a, **kw):
+        raise AssertionError(
+            "OpenAI was called to generate an answer with no evidence!"
+        )
+    monkeypatch.setattr(graph, "_generate_answer", _boom)
+
+    # Skip DB writes
+    monkeypatch.setattr(graph.memory, "save_user_message", lambda *a, **kw: None)
+    monkeypatch.setattr(graph.memory, "save_assistant_message", lambda *a, **kw: None)
+    monkeypatch.setattr(graph.memory, "get_recent", lambda *a, **kw: [])
+
+    r = run(
+        "where is sialkot",
+        tenant_id=tenant,
+        conversation_id=conv,
+        save_to_memory=False,
+    )
+
+    assert r["answer"] == graph.NO_ANSWER_MESSAGE
+    assert r["sources"] == []
+    assert "generate:refused(no_evidence)" in r["steps"]
+
+
+def test_no_evidence_persists_original_question(tenant_and_conv, monkeypatch):
+    """🔧 Audit trail: memory must store the ORIGINAL question, not the rewrite."""
+    tenant, conv = tenant_and_conv
+
+    # Force empty retrieval and a rewrite that changes the question
+    monkeypatch.setattr(graph.vector, "query", lambda **kw: [])
+    monkeypatch.setattr(
+        graph, "_rewrite_question",
+        lambda q: f"REWRITTEN::{q}",
+    )
+
+    run(
+        "where is sialkot",
+        tenant_id=tenant,
+        conversation_id=conv,
+        save_to_memory=True,
+    )
+
+    msgs = memory.get_recent(tenant, conv)
+    assert len(msgs) == 2
+    assert msgs[0]["role"] == "user"
+    # 🔧 Must contain what the user typed, NOT the rewritten version
+    assert msgs[0]["content"] == "where is sialkot"
+    assert "REWRITTEN::" not in msgs[0]["content"]
+    assert msgs[1]["content"] == graph.NO_ANSWER_MESSAGE
 
 
 # ==========================================
@@ -118,7 +186,8 @@ def test_hitl_disabled_answers_directly(tenant_and_conv, monkeypatch):
     )
 
     assert r["needs_approval"] is False
-    assert r["answer"]  # non-empty
+    assert r["answer"]
+    assert r["answer"] != graph.NO_ANSWER_MESSAGE  # 🔧 real answer, not refusal
     assert "generate:done" in r["steps"]
 
 
@@ -137,8 +206,9 @@ def test_no_results_triggers_rewrite(tenant_and_conv):
         save_to_memory=False,
     )
 
-    # steps should include a rewrite attempt
     assert any("rewrite" in s for s in r["steps"])
+    # 🔧 rewrite exhausted → gate fires
+    assert r["answer"] == graph.NO_ANSWER_MESSAGE
 
 
 # ==========================================
@@ -157,6 +227,8 @@ def test_injection_flagged(tenant_and_conv):
 
     assert r["suspicious"] is True
     assert len(r["injection_hits"]) >= 1
+    # 🔧 Empty tenant → no evidence → must refuse
+    assert r["answer"] == graph.NO_ANSWER_MESSAGE
 
 
 def test_rejects_invalid_tenant(tenant_and_conv):

@@ -34,7 +34,12 @@ class Settings(BaseSettings):
     # OpenAI Configuration
     # ==========================================
     openai_api_key: str = ""
-    openai_model: str = "gpt-4o-mini"          # ← FIXED
+    openai_model: str = "gpt-4o-mini"
+
+    # 🔧 NEW: OpenAI embedding configuration
+    # Used by both app.rag.embed_query and worker.ingest._embed_batch
+    openai_embedding_model: str = "text-embedding-3-small"
+    embed_batch_size: int = Field(default=100, ge=1, le=2048)
 
     # ==========================================
     # AWS Configuration (S3 only)
@@ -47,7 +52,10 @@ class Settings(BaseSettings):
     # ==========================================
     # Embedding Configuration
     # ==========================================
-    embedding_provider: str = "sentence-transformers"
+    # 🔧 FIX: default provider is now openai, not sentence-transformers
+    embedding_provider: str = "openai"
+    # Legacy fields — kept so existing installs don't break if they still
+    # reference embedding_model. Not used when embedding_provider="openai".
     embedding_model: str = "BAAI/bge-small-en-v1.5"
     embedding_device: str = "cpu"
     embed_dim: int = 384
@@ -71,7 +79,9 @@ class Settings(BaseSettings):
     # ==========================================
     # RAG Configuration
     # ==========================================
-    min_relevance: float = Field(default=0.25, ge=0.0, le=1.0)
+    # 🔧 FIX: raised default from 0.25 to 0.65 to reject irrelevant matches
+    # (your Sialkot scores were 0.535–0.565, so 0.25 let them through)
+    min_relevance: float = Field(default=0.65, ge=0.0, le=1.0)
     max_upload_bytes: int = 10 * 1024 * 1024
 
     # ==========================================
@@ -85,19 +95,38 @@ class Settings(BaseSettings):
     # ==========================================
     @model_validator(mode="after")
     def _check_embedding_dim(self) -> "Settings":
-        known = {
-            "BAAI/bge-small-en-v1.5": 384,
-            "BAAI/bge-base-en-v1.5": 768,
-            "BAAI/bge-large-en-v1.5": 1024,
-            "sentence-transformers/all-MiniLM-L6-v2": 384,
-            "sentence-transformers/all-mpnet-base-v2": 768,
-        }
-        expected = known.get(self.embedding_model)
-        if expected is not None and expected != self.embed_dim:
+        """
+        🔧 FIX: only check against known models when provider is
+        sentence-transformers. OpenAI text-embedding-3-* supports the
+        `dimensions` parameter, so embed_dim can be any value ≤ the
+        model's native size (1536 or 3072).
+        """
+        if self.embedding_provider == "sentence-transformers":
+            known = {
+                "BAAI/bge-small-en-v1.5": 384,
+                "BAAI/bge-base-en-v1.5": 768,
+                "BAAI/bge-large-en-v1.5": 1024,
+                "sentence-transformers/all-MiniLM-L6-v2": 384,
+                "sentence-transformers/all-mpnet-base-v2": 768,
+            }
+            expected = known.get(self.embedding_model)
+            if expected is not None and expected != self.embed_dim:
+                raise ValueError(
+                    f"embed_dim={self.embed_dim} does not match "
+                    f"embedding_model='{self.embedding_model}' "
+                    f"(expected {expected})"
+                )
+        elif self.embedding_provider == "openai":
+            # OpenAI text-embedding-3-* supports dimensions parameter
+            if self.embed_dim < 1 or self.embed_dim > 3072:
+                raise ValueError(
+                    f"embed_dim={self.embed_dim} out of range for OpenAI "
+                    "(must be 1–3072)"
+                )
+        else:
             raise ValueError(
-                f"embed_dim={self.embed_dim} does not match "
-                f"embedding_model='{self.embedding_model}' "
-                f"(expected {expected})"
+                f"embedding_provider='{self.embedding_provider}' is invalid "
+                "(must be 'openai' or 'sentence-transformers')"
             )
         return self
 

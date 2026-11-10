@@ -17,5 +17,6 @@
             "database": "atlas_ai",
             "username": "atlas_ai_owner"
         }
-    ]
+    ],
+    "python.terminal.useEnvFile": true
 }

@@ -12,7 +12,7 @@ Usage:
     result = process_document("some-document-uuid")
 """
 
-from functools import lru_cache
+import logging
 from typing import Any
 
 from app import vector
@@ -23,30 +23,46 @@ from app.ingest.chunker import chunk_text
 from app.ingest.extractor import extract_text
 from app.observability import trace
 
+# 🔧 FIX: reuse the single OpenAI-based embedder from app.rag so
+# document vectors and query vectors live in the same vector space.
+from app.rag import _openai_client
+
+
+logger = logging.getLogger(__name__)
+
 
 # ==========================================
-# EMBEDDING
+# EMBEDDING (OpenAI, batched)
 # ==========================================
-
-@lru_cache(maxsize=1)
-def _embedder():
-    from sentence_transformers import SentenceTransformer
-    s = settings()
-    return SentenceTransformer(s.embedding_model, device=s.embedding_device)
-
 
 def _embed_batch(texts: list[str]) -> list[list[float]]:
-    s = settings()
+    """
+    Embed a batch of texts with OpenAI.
+
+    OpenAI's embeddings endpoint accepts up to 2048 inputs per request,
+    but for reliability with mixed-size chunks we send them in sub-batches
+    of EMBED_BATCH_SIZE.
+    """
     if not texts:
         return []
-    vecs = _embedder().encode(
-        texts,
-        normalize_embeddings=s.normalize_embeddings,
-        convert_to_numpy=True,
-        batch_size=32,
-        show_progress_bar=False,
-    )
-    return vecs.tolist()
+
+    s = settings()
+    client = _openai_client()
+    batch_size = s.embed_batch_size
+
+    all_vectors: list[list[float]] = []
+    for start in range(0, len(texts), batch_size):
+        batch = texts[start:start + batch_size]
+        response = client.embeddings.create(
+            model=s.openai_embedding_model,
+            input=batch,
+            dimensions=s.embed_dim,
+        )
+        # Response preserves input order; collect in order.
+        for item in response.data:
+            all_vectors.append(item.embedding)
+
+    return all_vectors
 
 
 # ==========================================
@@ -133,25 +149,60 @@ def process_document(
         detail={"document_id": document_id, "s3_key": s3_key},
     )
 
+    logger.info(
+        f"Starting ingest: document_id={document_id} "
+        f"tenant={tenant_id} title={title!r}"
+    )
+
     try:
         # 2. Mark processing
         _set_status(document_id, "processing")
 
         # 3. Download from S3
+        logger.debug(f"Downloading s3_key={s3_key}")
         data = download_bytes(s3_key)
+        logger.debug(f"Downloaded {len(data)} bytes")
 
-        # 4. Extract text
-        extracted = extract_text(data, filename=title)
+        # 🔧 FIX: wrap extract_text so failures are logged with traceback
+        logger.debug(f"Extracting text from {title!r} ({len(data)} bytes)")
+        try:
+            extracted = extract_text(data, filename=title)
+        except Exception as e:
+            logger.error(
+                f"Extraction failed for document_id={document_id} "
+                f"title={title!r}: {type(e).__name__}: {e}",
+                exc_info=True,
+            )
+            raise
+
         if not extracted.strip():
-            raise RuntimeError("no text extracted from document")
+            raise RuntimeError(
+                f"no text extracted from document {document_id} "
+                f"(title={title!r}, {len(data)} bytes) — "
+                "likely a scanned/image-only PDF"
+            )
+
+        logger.debug(f"Extracted {len(extracted)} chars from {title!r}")
 
         # 5. Chunk
         chunks = chunk_text(extracted)
         if not chunks:
-            raise RuntimeError("chunking produced no chunks")
+            raise RuntimeError(
+                f"chunking produced no chunks for document {document_id} "
+                f"(title={title!r}, extracted_len={len(extracted)})"
+            )
 
-        # 6. Embed all chunks in one batch
+        logger.debug(f"Chunked into {len(chunks)} pieces")
+
+        # 6. Embed all chunks in sub-batches via OpenAI
+        logger.debug(f"Embedding {len(chunks)} chunks via OpenAI")
         vectors_vals = _embed_batch(chunks)
+
+        if len(vectors_vals) != len(chunks):
+            raise RuntimeError(
+                f"embedding returned {len(vectors_vals)} vectors for "
+                f"{len(chunks)} chunks — mismatch"
+            )
 
         # 7. Build Pinecone records
         new_version = _bump_version(document_id)
@@ -172,6 +223,7 @@ def process_document(
             )
 
         # 8. Upsert to Pinecone
+        logger.debug(f"Upserting {len(pinecone_vectors)} vectors to Pinecone")
         up = vector.upsert(pinecone_vectors)
 
         # 9. Mark ready
@@ -189,6 +241,12 @@ def process_document(
             },
         )
 
+        logger.info(
+            f"Ingest complete: document_id={document_id} "
+            f"chunks={len(chunks)} vectors={up.get('upserted_count', 0)} "
+            f"version={new_version}"
+        )
+
         return {
             "status": "ready",
             "chunks": len(chunks),
@@ -197,6 +255,15 @@ def process_document(
         }
 
     except Exception as exc:
+        # 🔧 FIX: log the full traceback before updating status,
+        # so you can see what actually broke in the terminal.
+        logger.error(
+            f"Ingest FAILED: document_id={document_id} "
+            f"title={title!r} "
+            f"error={type(exc).__name__}: {exc}",
+            exc_info=True,
+        )
+
         try:
             _set_status(document_id, "failed")
             _audit(
@@ -209,5 +276,8 @@ def process_document(
                 },
             )
         except Exception:
-            pass
+            # Even if DB updates fail, don't mask the original error
+            logger.exception(
+                f"Failed to record failure status for {document_id}"
+            )
         raise
