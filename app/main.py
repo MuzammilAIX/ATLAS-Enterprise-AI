@@ -21,6 +21,7 @@ Run:
 
 import datetime
 import uuid
+from contextlib import asynccontextmanager
 from typing import Any
 
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -36,10 +37,43 @@ from app.db import audit, connection
 from worker.ingest import process_document
 
 
+# ==========================================
+# LIFESPAN — graceful startup + shutdown
+# ==========================================
+
+@asynccontextmanager
+async def lifespan(app):
+    """Graceful startup + shutdown handlers."""
+    # ── STARTUP ──
+    # Warm up the pool so the first request doesn't pay the connect cost.
+    try:
+        from app.db import _get_pool
+        _get_pool()
+    except Exception:
+        pass
+
+    yield
+
+    # ── SHUTDOWN ──
+    # Close the connection pool cleanly so psycopg_pool.__del__
+    # doesn't crash with "cannot join current thread" during SIGTERM.
+    try:
+        from app.db import _pool
+        if _pool is not None:
+            _pool.close(timeout=5)
+    except Exception:
+        pass
+
+
+# ==========================================
+# APP
+# ==========================================
+
 app = FastAPI(
     title="ATLAS Enterprise AI",
     version="0.1.0",
     description="Multi-tenant RAG assistant",
+    lifespan=lifespan,
 )
 
 app.mount("/static", StaticFiles(directory="app/static"), name="static")
