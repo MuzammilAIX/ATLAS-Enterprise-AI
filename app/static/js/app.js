@@ -2,72 +2,125 @@
 
 const $ = id => document.getElementById(id);
 
-let conversationId = sessionStorage.getItem('atlas_conversation_id') || crypto.randomUUID();
+// ── UUID generator (works on HTTP; crypto.randomUUID is HTTPS-only) ──
+function uuidv4() {
+    if (window.crypto && typeof window.crypto.randomUUID === 'function') {
+        try {
+            return window.crypto.randomUUID();
+        } catch (e) {
+            // fall through
+        }
+    }
+    if (window.crypto && typeof window.crypto.getRandomValues === 'function') {
+        const bytes = new Uint8Array(16);
+        window.crypto.getRandomValues(bytes);
+        bytes[6] = (bytes[6] & 0x0f) | 0x40;  // version 4
+        bytes[8] = (bytes[8] & 0x3f) | 0x80;  // variant RFC 4122
+        const hex = Array.from(bytes, b => b.toString(16).padStart(2, '0')).join('');
+        return (
+            hex.slice(0, 8) + '-' +
+            hex.slice(8, 12) + '-' +
+            hex.slice(12, 16) + '-' +
+            hex.slice(16, 20) + '-' +
+            hex.slice(20, 32)
+        );
+    }
+    // Last resort — Math.random (weaker but works everywhere)
+    return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
+        const r = (Math.random() * 16) | 0;
+        const v = c === 'x' ? r : (r & 0x3) | 0x8;
+        return v.toString(16);
+    });
+}
+
+let conversationId = sessionStorage.getItem('atlas_conversation_id') || uuidv4();
 sessionStorage.setItem('atlas_conversation_id', conversationId);
 
-$('newChat').onclick = () => {
-    conversationId = crypto.randomUUID();
-    sessionStorage.setItem('atlas_conversation_id', conversationId);
-    $('messages').replaceChildren();
-    $('heroBlock').classList.remove('hidden');
-    toast('Started a new conversation');
-};
-
+// ── Toast ─────────────────────────────────────────
 const toast = msg => {
     const el = $('toast');
+    if (!el) return;
     el.textContent = msg;
     el.style.display = 'block';
-    setTimeout(() => el.style.display = 'none', 4000);
+    clearTimeout(toast._t);
+    toast._t = setTimeout(() => { el.style.display = 'none'; }, 4000);
 };
 
+// ── Fetch helper ──────────────────────────────────
 const api = async (path, options = {}) => {
     const res = await fetch(path, {
         ...options,
         headers: { 'Content-Type': 'application/json', ...(options.headers || {}) },
     });
     const data = await res.json().catch(() => ({ detail: res.statusText }));
-    if (!res.ok) throw Error(data.detail || `HTTP ${res.status}`);
+    if (!res.ok) throw Error(data.detail || ('HTTP ' + res.status));
     return data;
 };
 
+// ── Tab routing ───────────────────────────────────
 function view(name) {
     ['chat', 'docs', 'approval', 'admin'].forEach(x => {
-        $(x + 'View').classList.toggle('hidden', x !== name);
-        $(x + 'Tab').classList.toggle('active', x === name);
+        const v = $(x + 'View');
+        const t = $(x + 'Tab');
+        if (v) v.classList.toggle('hidden', x !== name);
+        if (t) t.classList.toggle('active', x === name);
     });
-    $('heading').textContent = {
-        chat: "Ask your organization's knowledge",
-        docs: 'Document management',
-        approval: 'Approval requests',
-        admin: 'Operational overview',
-    }[name];
+    const h = $('heading');
+    if (h) {
+        h.textContent = ({
+            chat: "Ask your organization's knowledge",
+            docs: 'Document management',
+            approval: 'Approval requests',
+            admin: 'Operational overview',
+        })[name] || '';
+    }
     if (name === 'docs') loadDocs();
     if (name === 'admin') loadMetrics();
     if (name === 'approval') loadApprovals();
 }
 
-$('chatTab').onclick = () => view('chat');
-$('docsTab').onclick = () => view('docs');
-$('adminTab').onclick = () => view('admin');
-$('approvalTab').onclick = () => view('approval');
-$('refreshApprovals').onclick = loadApprovals;
+// ── Wire up tabs safely (only if elements exist) ──
+['chat', 'docs', 'admin', 'approval'].forEach(x => {
+    const t = $(x + 'Tab');
+    if (t) t.onclick = () => view(x);
+});
 
+const _newChat = $('newChat');
+if (_newChat) {
+    _newChat.onclick = () => {
+        conversationId = uuidv4();
+        sessionStorage.setItem('atlas_conversation_id', conversationId);
+        const msgs = $('messages');
+        if (msgs) msgs.replaceChildren();
+        const hero = $('heroBlock');
+        if (hero) hero.classList.remove('hidden');
+        toast('Started a new conversation');
+    };
+}
+
+const _refresh = $('refreshApprovals');
+if (_refresh) _refresh.onclick = loadApprovals;
+
+// ── Chat ──────────────────────────────────────────
 function addMessage(content, kind, sources = [], extra = null) {
+    const messages = $('messages');
+    if (!messages) return;
+
     const el = document.createElement('div');
     el.className = 'message ' + kind;
     el.textContent = content;
 
-    if (sources.length) {
+    if (sources && sources.length) {
         const wrap = document.createElement('div');
         wrap.className = 'sources';
         sources.forEach((s, i) => {
             const d = document.createElement('details');
             const title = document.createElement('summary');
-            const score = (s.score ?? 0).toFixed(3);
-            const docId = s.metadata?.document_id || 'unknown';
+            const score = (s.score != null ? s.score : 0).toFixed(3);
+            const docId = (s.metadata && s.metadata.document_id) || 'unknown';
             title.textContent = `[${i + 1}] doc=${docId} · score=${score}`;
             const excerpt = document.createElement('p');
-            excerpt.textContent = (s.metadata?.text || '').slice(0, 400);
+            excerpt.textContent = ((s.metadata && s.metadata.text) || '').slice(0, 400);
             d.append(title, excerpt);
             wrap.append(d);
         });
@@ -83,69 +136,75 @@ function addMessage(content, kind, sources = [], extra = null) {
         el.append(info);
     }
 
-    $('messages').append(el);
-    $('messages').scrollTo({ top: $('messages').scrollHeight, behavior: 'smooth' });
+    messages.append(el);
+    messages.scrollTo({ top: messages.scrollHeight, behavior: 'smooth' });
 }
 
-$('chatForm').onsubmit = async e => {
-    e.preventDefault();
-    const q = $('question').value.trim();
-    if (!q) return;
+const chatForm = $('chatForm');
+if (chatForm) {
+    chatForm.onsubmit = async e => {
+        e.preventDefault();
+        const q = $('question').value.trim();
+        if (!q) return;
 
-    addMessage(q, 'user');
-    $('question').value = '';
-    $('heroBlock').classList.add('hidden');
+        addMessage(q, 'user');
+        $('question').value = '';
+        const hero = $('heroBlock');
+        if (hero) hero.classList.add('hidden');
 
-    const loading = document.createElement('div');
-    loading.className = 'message assistant';
-    loading.textContent = 'Searching approved documents...';
-    $('messages').append(loading);
-    $('messages').scrollTo({ top: $('messages').scrollHeight, behavior: 'smooth' });
+        const messages = $('messages');
+        const loading = document.createElement('div');
+        loading.className = 'message assistant';
+        loading.textContent = 'Searching approved documents...';
+        messages.append(loading);
+        messages.scrollTo({ top: messages.scrollHeight, behavior: 'smooth' });
 
-    try {
-        const r = await api('/query', {
-            method: 'POST',
-            body: JSON.stringify({
-                question: q,
-                tenant_id: ($('tenantInput').value.trim() || 'demo'),
-                conversation_id: conversationId,
-                safe_mode: $('safeMode').checked,
-                actor: 'demo-user',
-            }),
-        });
-        loading.remove();
+        try {
+            const r = await api('/query', {
+                method: 'POST',
+                body: JSON.stringify({
+                    question: q,
+                    tenant_id: ($('tenantInput').value.trim() || 'demo'),
+                    conversation_id: conversationId,
+                    safe_mode: $('safeMode').checked,
+                    actor: 'demo-user',
+                }),
+            });
+            loading.remove();
 
-        if (r.needs_approval) {
-            addMessage(
-                'This question requires human approval before I can answer it.\n\n' +
-                'Reason: ' + r.approval_reason,
-                'needs-approval',
-                [],
-                { approval_id: r.approval_id }
-            );
-        } else {
-            addMessage(r.answer || '(no answer)', 'assistant', r.sources || []);
+            if (r.needs_approval) {
+                addMessage(
+                    'This question requires human approval before I can answer it.\n\n' +
+                    'Reason: ' + (r.approval_reason || 'sensitive content'),
+                    'needs-approval',
+                    [],
+                    { approval_id: r.approval_id }
+                );
+            } else {
+                addMessage(r.answer || '(no answer)', 'assistant', r.sources || []);
+            }
+        } catch (err) {
+            loading.remove();
+            addMessage('Error: ' + err.message, 'error');
         }
-    } catch (err) {
-        loading.remove();
-        addMessage('Error: ' + err.message, 'error');
-    }
-};
+    };
+}
 
+// ── Suggestion buttons ────────────────────────────
 document.querySelectorAll('[data-q]').forEach(b => {
     b.onclick = () => {
-        $('question').value = b.dataset.q;
-        $('question').focus();
+        const q = $('question');
+        if (q) { q.value = b.dataset.q; q.focus(); }
     };
 });
 
-// ── Documents ──────────────────────────────────────
-
+// ── Documents ─────────────────────────────────────
 async function loadDocs() {
     const root = $('docs');
+    if (!root) return;
     root.textContent = 'Loading...';
     try {
-        const tenant = $('tenantInput').value.trim() || 'demo';
+        const tenant = ($('tenantInput').value.trim() || 'demo');
         const r = await api(`/documents/${encodeURIComponent(tenant)}`);
         root.replaceChildren();
 
@@ -167,7 +226,7 @@ async function loadDocs() {
             badge.textContent = d.status;
 
             const ver = document.createElement('span');
-            ver.textContent = `v${d.current_version}`;
+            ver.textContent = 'v' + d.current_version;
             ver.style.color = '#94a3b8';
 
             row.append(title, badge, ver);
@@ -178,53 +237,56 @@ async function loadDocs() {
     }
 }
 
-$('uploadForm').onsubmit = async e => {
-    e.preventDefault();
-    const f = $('file').files[0];
-    if (!f) return;
+const uploadForm = $('uploadForm');
+if (uploadForm) {
+    uploadForm.onsubmit = async e => {
+        e.preventDefault();
+        const f = $('file').files[0];
+        if (!f) return;
 
-    if (f.size > 10 * 1024 * 1024) {
-        toast('Maximum file size is 10 MB');
-        return;
-    }
+        if (f.size > 10 * 1024 * 1024) {
+            toast('Maximum file size is 10 MB');
+            return;
+        }
 
-    const fd = new FormData();
-    fd.append('file', f);
-    fd.append('tenant_id', $('tenantInput').value.trim() || 'demo');
-    fd.append('owner_sub', $('ownerSub').value.trim() || 'alice');
+        const fd = new FormData();
+        fd.append('file', f);
+        fd.append('tenant_id', ($('tenantInput').value.trim() || 'demo'));
+        fd.append('owner_sub', ($('ownerSub').value.trim() || 'alice'));
 
-    try {
-        toast('Uploading...');
-        const res = await fetch('/upload', { method: 'POST', body: fd });
-        const data = await res.json();
-        if (!res.ok) throw Error(data.detail || 'Upload failed');
-        toast(`Uploaded. Ingesting document ${data.document_id.slice(0, 8)}...`);
-        $('uploadForm').reset();
-        $('ownerSub').value = 'alice';
-        loadDocs();
-
-        let polls = 0;
-        const poll = setInterval(() => {
+        try {
+            toast('Uploading...');
+            const res = await fetch('/upload', { method: 'POST', body: fd });
+            const data = await res.json();
+            if (!res.ok) throw Error(data.detail || 'Upload failed');
+            toast('Uploaded. Ingesting document ' + data.document_id.slice(0, 8) + '...');
+            $('uploadForm').reset();
+            $('ownerSub').value = 'alice';
             loadDocs();
-            polls += 1;
-            if (polls >= 10) clearInterval(poll);
-        }, 3000);
-    } catch (err) {
-        toast(err.message);
-    }
-};
 
-// ── Approvals — FULL WORKFLOW ─────────────────────
+            let polls = 0;
+            const poll = setInterval(() => {
+                loadDocs();
+                polls += 1;
+                if (polls >= 10) clearInterval(poll);
+            }, 3000);
+        } catch (err) {
+            toast(err.message);
+        }
+    };
+}
 
+// ── Approvals — full workflow ─────────────────────
 async function loadApprovals() {
     const root = $('approvalList');
     const summary = $('approvalSummary');
+    if (!root) return;
 
     root.textContent = 'Loading approvals...';
-    summary.textContent = '';
+    if (summary) summary.textContent = '';
 
     try {
-        const tenant = $('tenantInput').value.trim() || 'demo';
+        const tenant = ($('tenantInput').value.trim() || 'demo');
         const [pendingRes, allRes] = await Promise.all([
             api(`/api/approvals?tenant_id=${encodeURIComponent(tenant)}`),
             api(`/api/approvals/all?tenant_id=${encodeURIComponent(tenant)}&limit=20`),
@@ -233,7 +295,7 @@ async function loadApprovals() {
         const pending = pendingRes.approvals || [];
         const all = allRes.approvals || [];
 
-        summary.textContent = `${pending.length} pending · ${all.length} recent`;
+        if (summary) summary.textContent = `${pending.length} pending · ${all.length} recent`;
 
         root.replaceChildren();
 
@@ -335,17 +397,17 @@ async function decideApproval(approvalId, approve, button) {
     }
 }
 
-// ── Metrics ────────────────────────────────────────
-
+// ── Metrics ───────────────────────────────────────
 async function loadMetrics() {
     const m = $('metrics');
     const g = $('guardrailMetrics');
+    if (!m) return;
 
     m.textContent = 'Loading...';
-    g.textContent = 'Loading...';
+    if (g) g.textContent = 'Loading...';
 
     try {
-        const tenant = $('tenantInput').value.trim() || 'demo';
+        const tenant = ($('tenantInput').value.trim() || 'demo');
         const [docs, apps] = await Promise.all([
             api(`/documents/${encodeURIComponent(tenant)}`),
             api(`/api/approvals/all?tenant_id=${encodeURIComponent(tenant)}&limit=500`),
@@ -362,17 +424,19 @@ async function loadMetrics() {
         }
 
         m.textContent = JSON.stringify({
-            tenant,
+            tenant: tenant,
             total_documents: docs.count || 0,
             documents_by_status: counts,
         }, null, 2);
 
-        g.textContent = JSON.stringify({
-            total_approvals: apps.count || 0,
-            approvals_by_status: appCounts,
-        }, null, 2);
+        if (g) {
+            g.textContent = JSON.stringify({
+                total_approvals: apps.count || 0,
+                approvals_by_status: appCounts,
+            }, null, 2);
+        }
     } catch (err) {
         m.textContent = err.message;
-        g.textContent = '';
+        if (g) g.textContent = '';
     }
 }
